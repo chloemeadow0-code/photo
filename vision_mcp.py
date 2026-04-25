@@ -2,52 +2,27 @@ import os
 import time
 import base64
 import asyncio
-import threading
+import json
 import requests
-from fastapi import FastAPI, Request
 import uvicorn
+from urllib.parse import parse_qs
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
+from starlette.types import ASGIApp, Scope, Receive, Send
 
 # ==========================================
-# 1. 环境变量与配置
+# 1. 环境变量与配置 (Zeabur 会自动读取这些)
 # ==========================================
 MACRODROID_ID = os.environ.get("MACRODROID_ID", "你的MacroDroid_ID")
 VISION_API_KEY = os.environ.get("VISION_API_KEY", "你的大模型KEY")
 VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1")
 VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-4o-mini")
 
-# 双端口配置
-RECEIVER_PORT = int(os.environ.get("RECEIVER_PORT", 8123))
-SSE_PORT = int(os.environ.get("SSE_PORT", 8000))
-
-# ==========================================
-# 2. 手机图片 HTTP 接收器 (端口 8123)
-# ==========================================
+# 缓冲区，用来暂存手机传来的图片
 photo_buffer = {}
-app = FastAPI()
-
-@app.post("/upload_photo")
-async def upload_photo(task_id: str, request: Request):
-    """接收手机端动态提取并通过 HTTP POST 过来的纯图片流"""
-    try:
-        image_bytes = await request.body()
-        if image_bytes:
-            photo_buffer[task_id] = base64.b64encode(image_bytes).decode('utf-8')
-            return {"status": "success"}
-        return {"status": "error", "message": "No image data received"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-def run_receiver():
-    # 静默运行，避免刷屏
-    uvicorn.run(app, host="0.0.0.0", port=RECEIVER_PORT, log_level="warning")
-
-# 丢进后台线程独立运行
-threading.Thread(target=run_receiver, daemon=True).start()
 
 # ==========================================
-# 3. FastMCP 核心服务 (SSE 模式, 端口 8000)
+# 2. FastMCP 核心服务
 # ==========================================
 mcp = FastMCP("VisionNode")
 
@@ -67,9 +42,9 @@ async def take_photo_and_analyze(prompt: str = "请详细描述你在这张照�
     except Exception as e:
         return f"❌ 唤醒手机网络失败: {e}"
 
-    # 2. 挂起等待接收端口 (8123) 传回图片
+    # 2. 挂起等待手机传回图片
     wait_time = 0
-    max_wait = 25 # 设为25秒，防 Rikkahub 彻底断连
+    max_wait = 25 # 防 Rikkahub 断连
     base64_image = ""
     
     while wait_time < max_wait:
@@ -105,10 +80,54 @@ async def take_photo_and_analyze(prompt: str = "请详细描述你在这张照�
     except Exception as e:
         return f"❌ 视觉模型解析崩溃: {str(e)}"
 
+# ==========================================
+# 3. Zeabur 单端口中间件拦截器 (核心魔法)
+# ==========================================
+class SinglePortMiddleware:
+    """将手机传图接口与 MCP 通信接口强行合并到同一个 Web 端口上"""
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        # 拦截手机的图片上传请求
+        if scope["type"] == "http" and scope["path"] == "/upload_photo" and scope["method"] == "POST":
+            try:
+                # 解析 URL 里的 ?task_id=xxx
+                query_string = scope.get("query_string", b"").decode("utf-8")
+                params = parse_qs(query_string)
+                task_id = params.get("task_id", [""])[0]
+
+                # 读取原生的裸图片数据 (Image raw body)
+                body = b""
+                while True:
+                    msg = await receive()
+                    body += msg.get("body", b"")
+                    if not msg.get("more_body", False): break
+                
+                if body and task_id:
+                    photo_buffer[task_id] = base64.b64encode(body).decode('utf-8')
+                    resp_json = b'{"status": "success", "message": "Photo saved"}'
+                else:
+                    resp_json = b'{"status": "error", "message": "Missing body or task_id"}'
+
+                await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": resp_json})
+                return
+            except Exception as e:
+                err_json = json.dumps({"status": "error", "message": str(e)}).encode("utf-8")
+                await send({"type": "http.response.start", "status": 500, "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": err_json})
+                return
+
+        # 其他所有请求（比如 /sse 和 /messages）全部放行给 FastMCP 去处理
+        await self.app(scope, receive, send)
+
 if __name__ == "__main__":
-    print(f"🚀 Vision MCP (SSE 模式) 正在启动...")
-    print(f"📡 手机图片接收端口: {RECEIVER_PORT}")
-    print(f"🔗 供 RikkaHub 连接的 SSE 端口: {SSE_PORT} -> URL 请填: http://127.0.0.1:{SSE_PORT}/sse")
+    # Zeabur 会自动注入 PORT 环境变量，默认兜底 8000
+    port = int(os.environ.get("PORT", 8000))
+    print(f"🚀 Vision MCP 正在 Zeabur 端口 {port} 上启动...")
     
-    # 核心改动：直接以 SSE 协议运行
-    mcp.run(transport="sse", host="0.0.0.0", port=SSE_PORT)
+    # 提取 FastMCP 底层的 ASGI 引擎并套上我们的护盾
+    app = SinglePortMiddleware(mcp.sse_app())
+    
+    uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
