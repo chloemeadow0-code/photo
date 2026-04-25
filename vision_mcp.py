@@ -1,90 +1,75 @@
 import os
 import time
-import json
 import base64
 import asyncio
 import threading
 import requests
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, Request
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
 # ==========================================
-# 1. 环境变量配置 (请根据实际情况填入)
+# 1. 环境变量与配置
 # ==========================================
-# 手机端 MacroDroid 的 Webhook 触发 ID
-MACRODROID_ID = os.environ.get("MACRODROID_ID", "YOUR_MACRODROID_ID")
-
-# 视觉大模型配置
-VISION_API_KEY = os.environ.get("VISION_API_KEY", "sk-xxxxxx")
+MACRODROID_ID = os.environ.get("MACRODROID_ID", "你的MacroDroid_ID")
+VISION_API_KEY = os.environ.get("VISION_API_KEY", "你的大模型KEY")
 VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1")
 VISION_MODEL = os.environ.get("VISION_MODEL", "gpt-4o-mini")
 
-# 接收手机图片的端口 (确保手机能访问到该服务器的这个端口)
+# 双端口配置
 RECEIVER_PORT = int(os.environ.get("RECEIVER_PORT", 8123))
+SSE_PORT = int(os.environ.get("SSE_PORT", 8000))
 
 # ==========================================
-# 2. 全局状态缓冲池
+# 2. 手机图片 HTTP 接收器 (端口 8123)
 # ==========================================
-# 存放手机传回来的图片 Base64，格式: {"task_id": "base64_string"}
 photo_buffer = {}
-
-# ==========================================
-# 3. 伴生 HTTP 接收器 (专接手机发来的图片)
-# ==========================================
 app = FastAPI()
 
 @app.post("/upload_photo")
-async def upload_photo(task_id: str = Form(...), photo: UploadFile = File(...)):
-    """手机拍照后，将图片 POST 到这个接口"""
+async def upload_photo(task_id: str, request: Request):
+    """接收手机端动态提取并通过 HTTP POST 过来的纯图片流"""
     try:
-        image_bytes = await photo.read()
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        photo_buffer[task_id] = base64_image
-        return {"status": "success", "message": "Photo received"}
+        image_bytes = await request.body()
+        if image_bytes:
+            photo_buffer[task_id] = base64.b64encode(image_bytes).decode('utf-8')
+            return {"status": "success"}
+        return {"status": "error", "message": "No image data received"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 def run_receiver():
-    # 禁用 uvciorn 的日志避免污染 MCP 的 stdio 通道
-    uvicorn.run(app, host="0.0.0.0", port=RECEIVER_PORT, log_level="critical")
+    # 静默运行，避免刷屏
+    uvicorn.run(app, host="0.0.0.0", port=RECEIVER_PORT, log_level="warning")
 
-# 启动后台接收器线程
+# 丢进后台线程独立运行
 threading.Thread(target=run_receiver, daemon=True).start()
 
 # ==========================================
-# 4. MCP 核心逻辑
+# 3. FastMCP 核心服务 (SSE 模式, 端口 8000)
 # ==========================================
-mcp = FastMCP("MobileCameraVision")
+mcp = FastMCP("VisionNode")
 
 @mcp.tool()
 async def take_photo_and_analyze(prompt: str = "请详细描述你在这张照片里看到了什么？环境、物品、人物状态等。") -> str:
     """
-    【视觉感知工具】当你需要“看看”用户周围的环境、或者用户让你“看一下”某样东西时调用此工具。
-    它会静默唤醒用户的手机摄像头抓拍一张当前视角的照片，并利用视觉大模型进行分析。
-    
-    参数:
-    - prompt: 你希望视觉模型侧重分析的内容，例如"看看屏幕上有什么"或"桌子上有什么吃的"。
+    【视觉感知工具】唤醒手机摄像头静默抓拍，并用大模型分析画面。
     """
-    if not MACRODROID_ID:
-        return "❌ 缺少 MACRODROID_ID，无法触发手机拍照。"
-
-    # 生成唯一的任务流水号
     task_id = f"snap_{int(time.time())}"
-    
-    # 1. 向手机发送拍照指令
     webhook_url = f"https://trigger.macrodroid.com/{MACRODROID_ID}/take_photo?task_id={task_id}"
+    
     try:
+        # 1. 触发手机拍照
         resp = await asyncio.to_thread(lambda: requests.get(webhook_url, timeout=10))
         if resp.status_code != 200:
-            return f"❌ 无法唤醒手机，状态码: {resp.status_code}"
+            return f"❌ 无法唤醒手机: {resp.status_code}"
     except Exception as e:
-        return f"❌ 唤醒手机网络请求失败: {e}"
+        return f"❌ 唤醒手机网络失败: {e}"
 
-    # 2. 挂起等待手机将图片发到我们的接收端口 (最长等待 30 秒)
+    # 2. 挂起等待接收端口 (8123) 传回图片
     wait_time = 0
-    max_wait = 30
+    max_wait = 25 # 设为25秒，防 Rikkahub 彻底断连
     base64_image = ""
     
     while wait_time < max_wait:
@@ -95,12 +80,11 @@ async def take_photo_and_analyze(prompt: str = "请详细描述你在这张照�
         wait_time += 1
 
     if not base64_image:
-        return "❌ 手机拍照超时或上传失败，没有接收到图像流。"
+        return "❌ 手机拍照超时或未将图片传回服务器。"
 
-    # 3. 将抓取到的画面送入视觉大模型
+    # 3. 将图片塞进视觉模型分析
     try:
         client = OpenAI(api_key=VISION_API_KEY, base_url=VISION_BASE_URL)
-        
         def _ask_vision():
             return client.chat.completions.create(
                 model=VISION_MODEL,
@@ -115,14 +99,16 @@ async def take_photo_and_analyze(prompt: str = "请详细描述你在这张照�
                 ],
                 max_tokens=800
             )
-            
         v_res = await asyncio.to_thread(_ask_vision)
-        ai_desc = v_res.choices[0].message.content.strip()
-        return f"📸 手机摄像头抓拍画面解析完成：\n\n{ai_desc}"
+        return f"📸 手机视角解析完成：\n\n{v_res.choices[0].message.content.strip()}"
         
     except Exception as e:
-        return f"❌ 图片抓拍成功，但视觉大模型解析崩溃了: {e}"
+        return f"❌ 视觉模型解析崩溃: {str(e)}"
 
 if __name__ == "__main__":
-    # 使用 stdio 模式启动，符合主流 MCP 客户端挂载规范
-    mcp.run(transport="stdio")
+    print(f"🚀 Vision MCP (SSE 模式) 正在启动...")
+    print(f"📡 手机图片接收端口: {RECEIVER_PORT}")
+    print(f"🔗 供 RikkaHub 连接的 SSE 端口: {SSE_PORT} -> URL 请填: http://127.0.0.1:{SSE_PORT}/sse")
+    
+    # 核心改动：直接以 SSE 协议运行
+    mcp.run(transport="sse", host="0.0.0.0", port=SSE_PORT)
