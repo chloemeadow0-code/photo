@@ -13,10 +13,10 @@ from starlette.types import ASGIApp, Scope, Receive, Send
 # ==========================================
 # 1. 环境变量与配置 (Zeabur 自动读取)
 # ==========================================
-MACRODROID_ID  = os.environ.get("MACRODROID_ID",  "你的MacroDroid_ID")
-VISION_API_KEY = os.environ.get("VISION_API_KEY", "你的大模型KEY")
+MACRODROID_ID   = os.environ.get("MACRODROID_ID",   "你的MacroDroid_ID")
+VISION_API_KEY  = os.environ.get("VISION_API_KEY",  "你的大模型KEY")
 VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1")
-VISION_MODEL   = os.environ.get("VISION_MODEL",   "gpt-4o-mini")
+VISION_MODEL    = os.environ.get("VISION_MODEL",    "gpt-4o-mini")
 
 # 照片缓冲区
 photo_buffer: dict[str, str] = {}
@@ -24,11 +24,7 @@ photo_buffer: dict[str, str] = {}
 # ==========================================
 # 2. FastMCP 核心服务
 # ==========================================
-mcp = FastMCP(
-    "VisionNode",
-    # 修复：SSE 心跳间隔，防止 Zeabur / RikkaHub 因空闲断开连接
-    sse_ping_interval=15,
-)
+mcp = FastMCP("VisionNode")
 
 @mcp.tool()
 async def take_photo_and_analyze(
@@ -55,9 +51,8 @@ async def take_photo_and_analyze(
         return f"❌ 唤醒手机网络失败: {e}"
 
     # 2. 轮询等待手机传回图片（最多 25 秒）
-    max_wait = 25
     base64_image = ""
-    for _ in range(max_wait):
+    for _ in range(25):
         if task_id in photo_buffer:
             base64_image = photo_buffer.pop(task_id)
             break
@@ -110,7 +105,7 @@ class SinglePortMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        # 健康检查端点（供 Zeabur / 监控工具调用）
+        # 健康检查端点
         if scope["type"] == "http" and scope["path"] == "/health":
             body = b'{"status":"ok"}'
             await send({
@@ -175,11 +170,9 @@ if __name__ == "__main__":
     print(f"   图片上传端点: http://0.0.0.0:{port}/upload_photo?task_id=xxx")
     print(f"   健康检查端点: http://0.0.0.0:{port}/health")
 
-    # 修复：用 get_asgi_app() 替代已废弃的 sse_app()
     try:
         raw_app = mcp.get_asgi_app()
     except AttributeError:
-        # 兼容旧版 mcp 库
         raw_app = mcp.sse_app()
 
     app = SinglePortMiddleware(raw_app)
@@ -190,6 +183,5 @@ if __name__ == "__main__":
         port=port,
         proxy_headers=True,
         forwarded_allow_ips="*",
-        # 修复：关闭 h11 的 keep-alive 超时限制，防止 SSE 被 Zeabur 网关切断
         timeout_keep_alive=120,
     )
