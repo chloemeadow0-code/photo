@@ -2,7 +2,6 @@ import os
 import time
 import base64
 import asyncio
-import json
 import requests
 import uvicorn
 from mcp.server.fastmcp import FastMCP
@@ -21,11 +20,11 @@ VISION_API_KEY  = os.environ.get("VISION_API_KEY",  "你的大模型KEY")
 VISION_BASE_URL = os.environ.get("VISION_BASE_URL", "https://api.openai.com/v1")
 VISION_MODEL    = os.environ.get("VISION_MODEL",    "gpt-4o-mini")
 
-# 照片缓冲区
-photo_buffer: dict[str, str] = {}
+# 最新照片（不再依赖 task_id，MacroDroid 直接 POST 即可）
+latest_photo: dict = {"data": None, "ts": 0}
 
 # ==========================================
-# 2. FastMCP 核心服务
+# 2. FastMCP 工具
 # ==========================================
 mcp = FastMCP("VisionNode")
 
@@ -35,34 +34,32 @@ async def take_photo_and_analyze(
 ) -> str:
     """
     【视觉感知工具】唤醒手机摄像头静默抓拍，并用大模型分析画面。
-    先触发 MacroDroid 拍照，等待手机回传图片后交给视觉模型解析。
+    触发 MacroDroid 拍照，等待手机回传图片后交给视觉模型解析。
     """
-    task_id = f"snap_{int(time.time())}"
-    webhook_url = (
-        f"https://trigger.macrodroid.com/{MACRODROID_ID}/take_photo"
-        f"?task_id={task_id}"
-    )
+    trigger_url = f"https://trigger.macrodroid.com/{MACRODROID_ID}/take_photo"
+    trigger_ts = time.time()
 
     # 1. 触发手机拍照
     try:
         resp = await asyncio.to_thread(
-            lambda: requests.get(webhook_url, timeout=10)
+            lambda: requests.get(trigger_url, timeout=10)
         )
         if resp.status_code != 200:
             return f"❌ 无法唤醒手机: HTTP {resp.status_code}"
     except Exception as e:
         return f"❌ 唤醒手机网络失败: {e}"
 
-    # 2. 轮询等待手机传回图片（最多 25 秒）
+    # 2. 等待手机上传新照片（最多 30 秒）
+    # 只接受触发之后上传的照片，避免拿到旧图
     base64_image = ""
-    for _ in range(25):
-        if task_id in photo_buffer:
-            base64_image = photo_buffer.pop(task_id)
+    for _ in range(30):
+        if latest_photo["data"] and latest_photo["ts"] >= trigger_ts:
+            base64_image = latest_photo["data"]
             break
         await asyncio.sleep(1)
 
     if not base64_image:
-        return "❌ 手机拍照超时，未在 25 秒内收到图片。"
+        return "❌ 手机拍照超时，未在 30 秒内收到图片。"
 
     # 3. 送入视觉模型分析
     try:
@@ -91,32 +88,35 @@ async def take_photo_and_analyze(
 
 
 # ==========================================
-# 3. 自定义路由
+# 3. 路由处理
 # ==========================================
 async def health_endpoint(request: Request):
     return JSONResponse({"status": "ok"})
 
 
 async def upload_photo_endpoint(request: Request):
+    """
+    MacroDroid 拍照后 POST 到此接口。
+    不需要任何参数，直接把图片二进制数据放 body 即可。
+    """
     try:
-        task_id = request.query_params.get("task_id", "")
         body = await request.body()
-        if body and task_id:
-            photo_buffer[task_id] = base64.b64encode(body).decode()
-            return JSONResponse({"status": "success", "message": "Photo saved"})
-        return JSONResponse(
-            {"status": "error", "message": "Missing body or task_id"},
-            status_code=400
-        )
+        if not body:
+            return JSONResponse(
+                {"status": "error", "message": "Empty body"},
+                status_code=400
+            )
+        latest_photo["data"] = base64.b64encode(body).decode()
+        latest_photo["ts"] = time.time()
+        return JSONResponse({"status": "success", "message": "Photo received"})
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 # ==========================================
-# 4. 低层级 SSE 路由（兼容 mcp 1.x）
+# 4. SSE 路由（兼容 mcp 1.x）
 # ==========================================
 sse_transport = SseServerTransport("/messages/")
-
 
 async def handle_sse(request: Request):
     async with sse_transport.connect_sse(
@@ -128,7 +128,6 @@ async def handle_sse(request: Request):
             mcp._mcp_server.create_initialization_options(),
         )
 
-
 app = Starlette(
     routes=[
         Route("/health",       health_endpoint),
@@ -138,7 +137,6 @@ app = Starlette(
     ]
 )
 
-
 # ==========================================
 # 5. 启动
 # ==========================================
@@ -146,7 +144,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     print(f"🚀 Vision MCP 启动于端口 {port}")
     print(f"   MCP SSE  端点: http://0.0.0.0:{port}/sse")
-    print(f"   图片上传端点: http://0.0.0.0:{port}/upload_photo?task_id=xxx")
+    print(f"   图片上传端点: http://0.0.0.0:{port}/upload_photo  (POST, body=图片二进制)")
     print(f"   健康检查端点: http://0.0.0.0:{port}/health")
 
     uvicorn.run(
