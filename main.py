@@ -5,13 +5,16 @@ import asyncio
 import json
 import requests
 import uvicorn
-from urllib.parse import parse_qs
 from mcp.server.fastmcp import FastMCP
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from openai import OpenAI
-from starlette.types import ASGIApp, Scope, Receive, Send
 
 # ==========================================
-# 1. 环境变量与配置 (Zeabur 自动读取)
+# 1. 环境变量与配置
 # ==========================================
 MACRODROID_ID   = os.environ.get("MACRODROID_ID",   "你的MacroDroid_ID")
 VISION_API_KEY  = os.environ.get("VISION_API_KEY",  "你的大模型KEY")
@@ -68,20 +71,15 @@ async def take_photo_and_analyze(
         def _ask_vision():
             return client.chat.completions.create(
                 model=VISION_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                },
-                            },
-                        ],
-                    }
-                ],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }},
+                    ],
+                }],
                 max_tokens=800,
             )
 
@@ -93,75 +91,56 @@ async def take_photo_and_analyze(
 
 
 # ==========================================
-# 3. 单端口中间件：合并 /upload_photo 与 MCP 路由
+# 3. 自定义路由
 # ==========================================
-class SinglePortMiddleware:
-    """
-    将手机传图接口（POST /upload_photo）与 MCP 的 SSE 接口
-    合并到同一个 Zeabur 端口上，无需额外开放端口。
-    """
+async def health_endpoint(request: Request):
+    return JSONResponse({"status": "ok"})
 
-    def __init__(self, app: ASGIApp):
-        self.app = app
 
-    async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        # 健康检查端点
-        if scope["type"] == "http" and scope["path"] == "/health":
-            body = b'{"status":"ok"}'
-            await send({
-                "type": "http.response.start",
-                "status": 200,
-                "headers": [(b"content-type", b"application/json")],
-            })
-            await send({"type": "http.response.body", "body": body})
-            return
-
-        # 手机图片上传端点
-        if (
-            scope["type"] == "http"
-            and scope["path"] == "/upload_photo"
-            and scope["method"] == "POST"
-        ):
-            await self._handle_upload(scope, receive, send)
-            return
-
-        # 其余请求（/sse、/messages 等）全部交给 FastMCP
-        await self.app(scope, receive, send)
-
-    async def _handle_upload(self, scope: Scope, receive: Receive, send: Send):
-        try:
-            qs = scope.get("query_string", b"").decode()
-            task_id = parse_qs(qs).get("task_id", [""])[0]
-
-            body = b""
-            while True:
-                msg = await receive()
-                body += msg.get("body", b"")
-                if not msg.get("more_body", False):
-                    break
-
-            if body and task_id:
-                photo_buffer[task_id] = base64.b64encode(body).decode()
-                resp_body = b'{"status":"success","message":"Photo saved"}'
-                status = 200
-            else:
-                resp_body = b'{"status":"error","message":"Missing body or task_id"}'
-                status = 400
-
-        except Exception as e:
-            resp_body = json.dumps({"status": "error", "message": str(e)}).encode()
-            status = 500
-
-        await send({
-            "type": "http.response.start",
-            "status": status,
-            "headers": [(b"content-type", b"application/json")],
-        })
-        await send({"type": "http.response.body", "body": resp_body})
+async def upload_photo_endpoint(request: Request):
+    try:
+        task_id = request.query_params.get("task_id", "")
+        body = await request.body()
+        if body and task_id:
+            photo_buffer[task_id] = base64.b64encode(body).decode()
+            return JSONResponse({"status": "success", "message": "Photo saved"})
+        return JSONResponse(
+            {"status": "error", "message": "Missing body or task_id"},
+            status_code=400
+        )
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 # ==========================================
-# 4. 启动入口
+# 4. 低层级 SSE 路由（兼容 mcp 1.x）
+# ==========================================
+sse_transport = SseServerTransport("/messages/")
+
+
+async def handle_sse(request: Request):
+    async with sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as streams:
+        await mcp._mcp_server.run(
+            streams[0],
+            streams[1],
+            mcp._mcp_server.create_initialization_options(),
+        )
+
+
+app = Starlette(
+    routes=[
+        Route("/health",       health_endpoint),
+        Route("/upload_photo", upload_photo_endpoint, methods=["POST"]),
+        Route("/sse",          handle_sse),
+        Mount("/messages/",    app=sse_transport.handle_post_message),
+    ]
+)
+
+
+# ==========================================
+# 5. 启动
 # ==========================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
@@ -169,13 +148,6 @@ if __name__ == "__main__":
     print(f"   MCP SSE  端点: http://0.0.0.0:{port}/sse")
     print(f"   图片上传端点: http://0.0.0.0:{port}/upload_photo?task_id=xxx")
     print(f"   健康检查端点: http://0.0.0.0:{port}/health")
-
-    try:
-        raw_app = mcp.get_asgi_app()
-    except AttributeError:
-        raw_app = mcp.sse_app()
-
-    app = SinglePortMiddleware(raw_app)
 
     uvicorn.run(
         app,
