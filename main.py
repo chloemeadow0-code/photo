@@ -90,42 +90,90 @@ async def take_photo_and_analyze(
 
 
 @mcp.tool()
-async def get_health_data(days: int = 3) -> str:
-    """
-    【健康数据查询】从 Supabase 读取 HC 同步的健康数据（步数、睡眠等）。
-    可指定查询最近几天，默认 3 天。
-    """
+async def get_health_data(days: int = 3):
+    """【健康数据查询】从Supabase读取HC同步的健康数据（步数、睡眠、心率、血氧等）。可指定查询最近几天，默认3天。"""
     try:
+        import json as _json
         now_bj = datetime.utcnow() + timedelta(hours=8)
         since = (now_bj - timedelta(days=days)).isoformat()
 
         def _query():
-            return (
-                supabase.table("health_data")
-                .select("*")
-                .gte("recorded_at", since)
-                .order("recorded_at", desc=True)
-                .execute()
-            )
+            return supabase.table("health_data").select("*").gte("recorded_at", since).order("recorded_at", desc=True).execute()
 
         res = await asyncio.to_thread(_query)
 
         if not res or not res.data:
             return f"📊 近{days}天暂无健康数据记录。"
 
-        lines = [f"📊 【近{days}天健康数据】:"]
+        # 按类型分组，自动去重
+        grouped = {}
+        seen = set()
         for r in res.data:
-            time_str = r.get("recorded_at", "")[:16]
-            data_type = r.get("data_type", "")
-            value = r.get("value", "")
+            dt = r.get('data_type', '')
+            val = r.get('value', '')
+            ts = r.get('recorded_at', '')
+            key = f"{dt}_{val}_{ts}"
+            if key in seen:
+                continue
+            seen.add(key)
+            grouped.setdefault(dt, []).append({"value": val, "time": ts})
 
-            if data_type == "steps":
-                lines.append(f"  [{time_str}] 🏃 步数: {value}步")
-            elif data_type == "sleep":
-                hours = round(float(value) / 3600, 1)
-                lines.append(f"  [{time_str}] 💤 睡眠: {hours}小时")
-            else:
-                lines.append(f"  [{time_str}] {data_type}: {value}")
+        lines = [f"📊 【近{days}天健康数据报告】:\n"]
+
+        if 'steps' in grouped:
+            for s in grouped['steps']:
+                t = s['time'][:16].replace('T', ' ')
+                lines.append(f"  [{t}] 🏃 步数: {s['value']}步")
+
+        if 'sleep' in grouped:
+            for s in grouped['sleep']:
+                t = s['time'][:16].replace('T', ' ')
+                hours = round(float(s['value']) / 3600, 1)
+                lines.append(f"  [{t}] 💤 睡眠: {hours}小时")
+
+        if 'heart_rate' in grouped:
+            vals = [float(s['value']) for s in grouped['heart_rate'] if s['value']]
+            if vals:
+                avg = round(sum(vals) / len(vals))
+                lines.append(f"  🫀 心率: 平均{avg}bpm | 最高{int(max(vals))}bpm | 最低{int(min(vals))}bpm (共{len(vals)}条记录)")
+
+        if 'resting_heart_rate' in grouped:
+            for s in grouped['resting_heart_rate']:
+                t = s['time'][:16].replace('T', ' ')
+                lines.append(f"  [{t}] 💓 静息心率: {s['value']}bpm")
+
+        if 'blood_oxygen' in grouped:
+            vals = [float(s['value']) for s in grouped['blood_oxygen'] if s['value']]
+            if vals:
+                avg = round(sum(vals) / len(vals))
+                lines.append(f"  🩸 血氧: 平均{avg}% | 最高{int(max(vals))}% | 最低{int(min(vals))}% (共{len(vals)}条记录)")
+
+        if 'total_calories' in grouped:
+            for s in grouped['total_calories']:
+                try:
+                    d = _json.loads(s['value']) if isinstance(s['value'], str) else s['value']
+                    cal = round(float(d.get('calories', 0)))
+                    lines.append(f"  🔥 热量消耗: {cal}kcal")
+                except:
+                    lines.append(f"  🔥 热量消耗: {s['value']}")
+
+        if 'distance' in grouped:
+            for s in grouped['distance']:
+                try:
+                    d = _json.loads(s['value']) if isinstance(s['value'], str) else s['value']
+                    km = round(float(d.get('meters', 0)) / 1000, 2)
+                    lines.append(f"  🚶 距离: {km}km")
+                except:
+                    lines.append(f"  🚶 距离: {s['value']}")
+
+        if 'exercise' in grouped:
+            for s in grouped['exercise']:
+                try:
+                    d = _json.loads(s['value']) if isinstance(s['value'], str) else s['value']
+                    dur = round(d.get('duration_seconds', 0) / 60)
+                    lines.append(f"  🏋️ 运动: {dur}分钟")
+                except:
+                    lines.append(f"  🏋️ 运动: {s['value']}")
 
         return "\n".join(lines)
     except Exception as e:
