@@ -1,5 +1,5 @@
 mcp==1.2.0
-openai>=1.0.0
-requests>=2.31.0
+supabase
 uvicorn>=0.29.0
 starlette>=0.37.0
+httpx
