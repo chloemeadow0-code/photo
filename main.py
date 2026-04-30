@@ -194,8 +194,10 @@ async def upload_photo_endpoint(request: Request):
             return JSONResponse({"status": "error", "message": "Empty body"}, status_code=400)
         latest_photo["data"] = base64.b64encode(body).decode()
         latest_photo["ts"] = time.time()
+        print(f"✅ 收到图片，大小: {len(body)} bytes, ts: {latest_photo['ts']}")
         return JSONResponse({"status": "success", "message": "Photo received"})
     except Exception as e:
+        print(f"❌ upload_photo 异常: {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
@@ -237,7 +239,8 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=port,
-        proxy_headers=True,          # ← Zeabur 反向代理必须
-        forwarded_allow_ips="*",     # ← Zeabur 反向代理必须
-        timeout_keep_alive=120,      # ← SSE 长连接必须
+        proxy_headers=True,                        # ← Zeabur 反向代理必须
+        forwarded_allow_ips="*",                   # ← Zeabur 反向代理必须
+        timeout_keep_alive=120,                    # ← SSE 长连接必须
+        h11_max_incomplete_event_size=10485760,    # ← 允许最大 10MB 图片上传
     )
